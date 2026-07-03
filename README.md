@@ -14,64 +14,69 @@ project: every design decision is documented below, including the wrong ones.
 
 ### Record format on disk
 
-Each record would be represented by each line within the file. The record would
-be composed of the following fields: 
-
-keylen | vallen | crc32 | flag | key | value
+Records will be stored sequentially on a disk file with the following format:
+keylen | vallen | crc32 | flag | key | value | magic
 
 - [4 bytes] keylen: size of the key in bytes
 - [4 bytes] vallen: size of value in bytes
-- [4 bytes] crc32: non cryptographic hash of the record, including flag, key, and val
+- [4 bytes] crc32: hash of the flag, key, and value
 - [4 bytes] flag: special attributes about the record
 - [keylen bytes] key: string of key in bytes
 - [vallen bytes] value: string of the value in bytes
+- [4 bytes] magic: a special number indicating end of a record
 
 Detecting truncated lines is done as follows:
-- The line must have at least 12 bytes containing the keylen, vallen, and crc32
-- The sum of keylen and vallen should be at least the length of the line
-- The crc32 value should match the computed crc32 of the key and value
+- The line length should be keylen + vallen + 20 bytes
+- The crc32 value should be equal to the crc(flag, key, value, magic)
+- The magic value should be present
 
 
 ### Write path (PUT)
 
-First, we append a new record in the format described above on a newline. We
-escape newline characters in the key and value by converting them to base64.
-The offset of the write is then written back to the in-memory index. Initially,
-we would flush the database to disk on each write, but would later compare to
-OS-controlled synchronization or periodic background flushing.
+Write updates the in-memory index and the database file. The index tracks keys
+and their file offsets, whereas the database file has the actual value. To
+create a record, we compute the elements of the format above and serialize them
+as a stream of bytes. Once written to disk, the offset is written-back to the
+in-memory index for the next read.
+
+We have 3 possible synchronization strategies:
+- flush to disk on each write; for simplicity this is our default scheme
+- rely on the OS synchronization
+- periodic background flushing
 
 ### Read path (GET)
 
 The in-memory index stores the key and its respective offset within the
-database file. Initialized at startup, the in-memory index is the list of
-all items present in the database. Thus, to read a given item:
-- Find the item in memory, return 404 or other fail error code on miss
-- Use the item offset to read its corresponding value in the database file
+database file. Initialized at startup, the in-memory index tracks all items
+present in the database. To read a given key:
+- Lookup the key within the index, return 404 if not found
+- Use the offset to read the value in the database file
 
 
 ### DELETE and tombstones
 
 Deleting items consist in inserting a special `tombstone` entry indicating the
-item has been deleted. This would be done by changing a specific bit within the
-flags. After checking the item within the in-memory database, we will append
-a new record in the file with the tombstone flag on.
+item has been deleted. Essentially, a tombstone record has the particular bit
+flag set, and the `vallen` is set to 0. After the item is serialized to disk,
+we can remove the entry from the in-memory index.
 
-Note that compaction would be triggered as a separate process, and the space
-would be reclaimed accordingly.
+The approach above indicates the file keeps growing on delete, and would require
+compaction to reclaim disk space.
 
 ### Startup / crash recovery
 
 Startup creates the in-memory index by reading the entries from the database
-file. The file is read top to bottom, each line is a parsed into a record, and
-inserted into the in-memory index. When an existing entry is found, the offset
-is overriden with the new entry. On a tombstone, we remove the entry from the 
-in-memory index.
-
+file. The file is read top to bottom, each record is parsed and inserted into
+the in-memory index:
+- When an existing entry is found, we overwrite its stored offset.
+- On a tombstone, we remove the entry from the in-memory index.
+- When incomplete, we stop scanning as this indicates an integrity violation
 
 ### Torn writes
 
 Every entry has a CRC value, which is used to check the truncation or
-modification of the record line.
+modification of the record line. In addition, we have a magic number at the end
+of each record to track when a record is fully written.
 
 ## Open questions (stage 2+)
 
